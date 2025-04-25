@@ -11,9 +11,13 @@ export class WebSocketService {
   constructor(server: HTTPServer) {
     this.io = new Server(server, {
       cors: {
-        origin: process.env.CLIENT_URL || 'http://localhost:5173',
-        methods: ['GET', 'POST']
-      }
+        origin: [
+          'http://localhost:5173',
+          'https://nova-crm-frontend.vercel.app'
+        ],
+        methods: ['GET', 'POST'],
+        credentials: true,
+      },
     });
 
     this.io.on('connection', (socket) => {
