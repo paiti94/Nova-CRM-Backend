@@ -146,14 +146,12 @@ router.post('/folders', validateAuth0Token, attachUser as express.RequestHandler
 router.post('/presigned-url', validateAuth0Token, attachUser as express.RequestHandler, async (req, res) => {
   try {
     const { fileName, fileType, folderId, clientId } = req.body;
-    console.log(req.body);
     if (!fileName || !folderId || !clientId) {
        res.status(400).json({ message: 'Missing required fields' });
        return;
     }
     const key = fileUploadService.generateFileKey(fileName, req.user._id, folderId);
     const presignedUrl = await fileUploadService.generatePresignedUrlForUploading(key, fileType);
-    
     res.json({ presignedUrl, key });
   } catch (error) {
     console.error('Error generating presigned URL:', error);
@@ -180,6 +178,7 @@ router.post('/', validateAuth0Token, attachUser as express.RequestHandler, async
       clientId: clientId || null,
       accessibleTo: clientId ? [clientId] : [],
       task: taskId || null,
+      readBy: [], 
     });
     await file.save();
     res.status(201).json(file);
@@ -305,5 +304,51 @@ router.delete('/folders/:folderId', validateAuth0Token, attachUser as express.Re
     res.status(500).json({ message: 'Error deleting folder' });
   }
 });
+
+// PATCH /files/:fileId/mark-read
+router.patch('/:fileId/mark-read', async (req, res) => {
+  const { fileId } = req.params;
+  const userId = req.body.userId;
+
+  if (!userId)  {
+    res.status(400).json({ error: 'Missing userId' });
+    return;
+  }
+
+  try {
+    await File.findByIdAndUpdate(fileId, {
+      $addToSet: { readBy: userId }, // prevents duplicates
+    });
+     res.json({ message: 'Marked as read' });
+     return;
+  } catch (err) {
+     res.status(500).json({ error: 'Failed to mark as read' });
+     return;
+  }
+});
+
+// GET /files/unread-count?clientId=xxx&userId=xxx
+router.get('/unread-count', async (req, res) => {
+  const { clientId, userId } = req.query;
+
+  if (!clientId || !userId) {
+     res.status(400).json({ error: 'Missing clientId or userId' });
+     return;
+  }
+
+  try {
+    const count = await File.countDocuments({
+      clientId,
+      readBy: { $ne: userId },
+    });
+
+     res.json({ unreadCount: count });
+     return;
+  } catch (err) {
+     res.status(500).json({ error: 'Failed to count unread files' });
+     return;
+  }
+});
+
 
 export default router;
