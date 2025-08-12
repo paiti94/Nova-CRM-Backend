@@ -1,4 +1,4 @@
-import express, { Router } from 'express';
+import express, { RequestHandler, Router } from 'express';
 import { ManagementClient } from 'auth0';
 import { validateAuth0Token, attachUser } from '../middleware/auth';
 import User from '../models/User';
@@ -104,7 +104,7 @@ publicRouter.post('/init-admin', async (req, res) => {
 
 // Protected routes
 protectedRouter.use(validateAuth0Token);
-protectedRouter.use(attachUser as express.RequestHandler);
+protectedRouter.use(attachUser as RequestHandler);
 
 // Get all users
 protectedRouter.get('/', async (req, res) => {
@@ -128,6 +128,7 @@ protectedRouter.get('/', async (req, res) => {
       };
   
       const user = await User.findByIdAndUpdate(req.user._id, updates, { new: true });
+      
       res.json(user);
       return;
     } catch (error) {
@@ -136,17 +137,45 @@ protectedRouter.get('/', async (req, res) => {
     }
   });
   
+  // protectedRouter.get('/me', async (req, res) => {
+  //   try {
+  //     const user = await User.findById(req.user._id).select('-password');
+  //     if (!user) {
+  //        res.status(404).json({ message: 'User not found' });
+  //        return;
+  //     }
+  //     res.json(user);
+  //     console.log(user);
+  //   } catch (error) {
+  //     res.status(500).json({ message: 'Error fetching user data' });
+  //   }
+  // });
+
   protectedRouter.get('/me', async (req, res) => {
     try {
-      const user = await User.findById(req.user._id).select('-password');
-      if (!user) {
-         res.status(404).json({ message: 'User not found' });
-         return;
+      // base user document (thanks to toJSON transform and select:false, tokens won't serialize)
+      const baseUser = await User.findById(req.user._id)
+        .select('-password -auth0Id')
+        .lean();
+  
+      if (!baseUser) {
+        res.status(404).json({ message: 'User not found' });
+        return;
       }
-      res.json(user);
-      console.log(user);
+  
+      // check connection using a separate query that explicitly selects hidden fields
+      const tokenDoc = await User.findById(req.user._id)
+        .select('+msTokens.access_token')
+        .lean();
+  
+      const msConnected = !!tokenDoc?.msTokens?.access_token;
+  
+      res.json({ ...baseUser, msConnected }); // <-- boolean only
     } catch (error) {
+      console.error('Error fetching user data:', error);
       res.status(500).json({ message: 'Error fetching user data' });
+
+      
     }
   });
 

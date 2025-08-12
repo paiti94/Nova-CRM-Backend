@@ -78,7 +78,7 @@ router.post('/:taskId/comments', validateAuth0Token, attachUser as express.Reque
   }
 });
 
-router.get('/:taskId/comments', validateAuth0Token, attachUser as express.RequestHandler, async(req, res)=>{
+router.get('/:taskId/comments', validateAuth0Token , attachUser as express.RequestHandler, async(req, res)=>{
   const {taskId} = req.params;
   try {
     const task = await Task.findById(taskId).populate('comments.user');

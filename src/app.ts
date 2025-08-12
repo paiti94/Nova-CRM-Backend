@@ -8,11 +8,14 @@ import taskRouter from './routes/tasks';
 import fileRouter from './routes/files';
 import dashboardRouter from './routes/dashboard';
 import tagRouter from './routes/tags';
+import microsoftAuthRouter from './routes/microsoftAuth';
 import { createServer } from 'http';
 import { WebSocketService } from './services/websocket';
 import { FolderService } from './services/folderService';
 import adminRouter from './routes/adminRoutes';
-import { attachUser, validateAuth0Token } from './middleware/auth';
+import { attachUser, validateAuth0Token, } from './middleware/auth';
+import helmet from 'helmet';
+import rateLimit from 'express-rate-limit';
 
 dotenv.config();
 // Override console.log before any other imports
@@ -29,24 +32,13 @@ console.error = (...args) => {
 const app: Express = express();
 const port = process.env.PORT || 5001;
 
-const allowedOrigins = [
-  'http://localhost:5173',
-  'https://nova-crm-frontend.vercel.app'
-];
-
+// Basic middleware
 app.use(cors({
-  origin: (origin, callback) => {
-    if (!origin || allowedOrigins.includes(origin)) {
-      callback(null, true);
-    } else {
-      callback(new Error('Not allowed by CORS'));
-    }
-  },
+  origin: process.env.CLIENT_URL || 'http://localhost:5173',
   credentials: true,
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH'],
   allowedHeaders: ['Content-Type', 'Authorization'],
 }));
-
 
 app.use(express.json());
 
@@ -55,10 +47,31 @@ app.use((req, res, next) => {
   console.log(`${req.method} ${req.path}`);
   next();
 });
+app.use(helmet({
+  contentSecurityPolicy: false, // if you need to adjust CSP later
+}));
 
+app.use(express.json({ limit: '200kb' })); // already doing JSON—set a limit
+
+app.use(cors({
+  origin: process.env.CLIENT_URL, // exact origin only
+  credentials: true,
+  methods: ['GET','POST','PUT','DELETE','PATCH'],
+  allowedHeaders: ['Content-Type','Authorization'],
+}));
+
+// Rate limit sensitive routes
+const sensitiveLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 30, // tweak as needed
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+app.use('/api/microsoft', sensitiveLimiter);
+app.use('/api/users', sensitiveLimiter);
 // Routes - just use the combined router
 app.use('/api/users', userRouter);
-
+app.use('/api/microsoft', microsoftAuthRouter);
 // Protected routes - add middleware here
 const protectedRoutes = express.Router();
 protectedRoutes.use(validateAuth0Token);
@@ -71,9 +84,9 @@ protectedRoutes.use('/files', fileRouter);
 protectedRoutes.use('/dashboard', dashboardRouter);
 protectedRoutes.use('/admin', adminRouter);
 protectedRoutes.use('/tags', tagRouter);
-
 // Use the protected routes after the public ones
 app.use('/api', protectedRoutes);
+
 
 // Error handling middleware
 app.use((err: any, req: express.Request, res: express.Response, next: express.NextFunction) => {

@@ -1,105 +1,143 @@
 import { auth } from 'express-oauth2-jwt-bearer';
-import { Request, Response, NextFunction } from 'express';
+import { Request, Response, NextFunction, RequestHandler } from 'express';
 import User from '../models/User';
 import { FolderService } from '../services/folderService';
 import axios from 'axios';
 import dotenv from 'dotenv';
+import jwt from 'jsonwebtoken'; // or 'jose' for better security in prod
 
 dotenv.config();
 
 export const validateAuth0Token = auth({
-  audience: process.env.AUTH0_AUDIENCE,
-  issuerBaseURL: `https://${process.env.AUTH0_DOMAIN}`,
-});
+  issuerBaseURL: `https://${process.env.AUTH0_DOMAIN}`,   // e.g. dev-xyz.us.auth0.com
+  audience: process.env.AUTH0_AUDIENCE,                   // your API Identifier
+  tokenSigningAlg: 'RS256',                               // default, but explicit is nice
+  // Optional hardening:
+  clockTolerance: 5,                                      // small leeway for clock skew (seconds)
+}) as RequestHandler;
 
+// export const attachUser = async (req: Request, res: Response, next: NextFunction) => {
+//   try {
+//     const auth0Id = req.auth?.payload?.sub;
+//     if (!auth0Id) {
+//       return res.status(401).json({ message: 'Unauthorized - No auth0Id' });
+//     }
 
-export const attachUser = async (req: Request, res: Response, next: NextFunction) => {
+//     // Get the access token from the Authorization header
+//     const accessToken = req.headers.authorization?.split(' ')[1];
+//     if (!accessToken) {
+//       return res.status(401).json({ message: 'No access token provided' });
+//     }
+
+//     let user = await User.findOne({ auth0Id });
+
+//     if (!user) {
+//       // Fetch user info from Auth0
+//       const userInfo = await getUserInfoFromAuth0(accessToken);
+//       console.log('Auth0 user info:', userInfo);
+
+//       // Create new user
+//       user = await User.create({
+//         auth0Id,
+//         email: userInfo.email,
+//         name: userInfo.name || userInfo.nickname,
+//         avatar: userInfo.picture,
+//         role: 'user', // Default role
+//         status: 'active',
+//         lastLogin: new Date(), // Set lastLogin to now
+//         createdAt: new Date(), // Set createdAt to now
+//         updatedAt: new Date() 
+//       });
+
+//       // Create default folders for the new user
+//       await FolderService.createDefaultFolders(user);
+//       console.log('Created default folders for new user:', user._id);
+//     }else {
+//       // Update last login time when user logs in
+//       user.lastLogin = new Date();
+//       await user.save();
+//     }
+
+//     req.user = user;
+//     next();
+//   } catch (error) {
+//     console.error('Error in attachUser middleware:', error);
+//     res.status(500).json({ message: 'Internal Server Error' });
+//     // next(error);
+//   }
+// };
+
+// async function getUserInfoFromAuth0(accessToken: string) {
+//   try {
+//     const response = await axios.get(
+//       `https://${process.env.AUTH0_DOMAIN}/userinfo`,
+//       {
+//         headers: {
+//           Authorization: `Bearer ${accessToken}`
+//         }
+//       }
+//     );
+//     return response.data;
+//   } catch (error) {
+//     console.error('Error fetching user info from Auth0:', error);
+//     throw error;
+//   }
+// }
+
+export const attachUser: RequestHandler = async (req, res, next) => {
   try {
-    const auth0Id = req.auth?.payload?.sub;
-    if (!auth0Id) {
-      return res.status(401).json({ message: 'Unauthorized - No auth0Id' });
-    }
+    const sub = req.auth?.payload?.sub;
+    if (!sub) { res.status(401).json({ message: 'Unauthorized - no sub' }); return; }
 
-    // Get the access token from the Authorization header
-    const accessToken = req.headers.authorization?.split(' ')[1];
-    if (!accessToken) {
-      return res.status(401).json({ message: 'No access token provided' });
-    }
-
-    let user = await User.findOne({ auth0Id });
-
+    let user = await User.findOne({ auth0Id: sub });
     if (!user) {
-      // Fetch user info from Auth0
-      const userInfo = await getUserInfoFromAuth0(accessToken);
-      console.log('Auth0 user info:', userInfo);
+      // Optional: fetch userinfo
+      const accessToken = req.headers.authorization?.slice(7) || '';
+      let userInfo: any = {};
+      try {
+        const r = await axios.get(`https://${process.env.AUTH0_DOMAIN}/userinfo`, {
+          headers: { Authorization: `Bearer ${accessToken}` }
+        });
+        userInfo = r.data || {};
+      } catch {}
 
-      // Create new user
       user = await User.create({
-        auth0Id,
+        auth0Id: sub,
         email: userInfo.email,
-        name: userInfo.name || userInfo.nickname,
+        name: userInfo.name || 'New User',
         avatar: userInfo.picture,
-        role: 'user', // Default role
+        role: 'user',
         status: 'active',
-        lastLogin: new Date(), // Set lastLogin to now
-        createdAt: new Date(), // Set createdAt to now
-        updatedAt: new Date() 
+        lastLogin: new Date(),
+        createdAt: new Date(),
+        updatedAt: new Date(),
       });
-
-      // Create default folders for the new user
       await FolderService.createDefaultFolders(user);
-      console.log('Created default folders for new user:', user._id);
-    }else {
-      // Update last login time when user logs in
+    } else {
       user.lastLogin = new Date();
       await user.save();
     }
 
     req.user = user;
     next();
-  } catch (error) {
-    console.error('Error in attachUser middleware:', error);
+  } catch (e) {
+    console.error('attachUser error', e);
     res.status(500).json({ message: 'Internal Server Error' });
-    // next(error);
   }
 };
 
-async function getUserInfoFromAuth0(accessToken: string) {
+export function verifyAuth0Jwt(token: string) {
+  // In production, fetch JWKS keys & verify signature!
+  // This example is only for dev/local and will not verify signatures.
   try {
-    const response = await axios.get(
-      `https://${process.env.AUTH0_DOMAIN}/userinfo`,
-      {
-        headers: {
-          Authorization: `Bearer ${accessToken}`
-        }
-      }
-    );
-    return response.data;
-  } catch (error) {
-    console.error('Error fetching user info from Auth0:', error);
-    throw error;
+    const decoded = jwt.decode(token, { complete: true });
+    if (!decoded) throw new Error("Invalid token");
+    // Optionally check `aud`, `iss`, etc.
+    return decoded.payload;
+  } catch (err) {
+    return null;
   }
 }
-
-async function updateAuth0UserPicture(userId:string, imageUrl:string, accessToken: string){
-    // Make the PATCH request to update the user's picture
-    try{
-      await axios.patch(
-        `https://${process.env.REACT_APP_AUTH0_DOMAIN}/api/v2/users/${userId}`,
-        { picture: imageUrl },
-        {
-          headers: {
-            Authorization: `Bearer ${accessToken}`,
-            'Content-Type': 'application/json'
-          }
-        }
-      );
-
-      console.log('User picture updated successfully');
-    } catch (error) {
-      console.error('Error updating user picture in Auth0:', error);
-    }
-};
 
 // Add type definition for the user property
 declare global {

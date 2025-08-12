@@ -1,6 +1,14 @@
 import mongoose, { Schema, Document } from 'mongoose';
-import Folder from './Folder';
-import crypto from 'crypto';
+
+// The interface for the Microsoft Outlook tokens
+interface IOutlookTokens {
+  access_token: string;
+  refresh_token?: string;
+  token_type: string;
+  expires_at: Date;
+  expires_in: number;
+  scope: string;
+}
 
 function generateInitialsAvatar(name: string): string {
   const initials = name
@@ -53,6 +61,7 @@ export interface IUser extends Document {
   updatedAt: Date;
   tags?: string[];
   status: 'pending' | 'active';
+  msTokens?: IOutlookTokens; // <-- Added the optional Outlook tokens
 }
 
 const UserSchema = new Schema({
@@ -77,21 +86,23 @@ const UserSchema = new Schema({
     type: String,
     enum: ['pending', 'active'],
     default: 'pending'
+  },
+  msTokens: {
+    access_token: { type: String, select: false },
+    refresh_token: { type: String, select: false },
+    token_type: String,
+    expires_at: Date,
+    expires_in: Number,
+    scope: String,
+  },
+}, {
+  toJSON: {
+    transform(doc, ret) {
+      delete ret.msTokens; // never serialize to client
+      return ret;
+    }
   }
 });
-
-// Middleware to delete associated folders when a user is deleted
-// UserSchema.pre('findOneAndDelete', async function (next) {
-//   try {
-//     const userId = this.getFilter()['_id']; // Get the user ID from the filter
-//     await Folder.deleteMany({ userId }); // Delete all folders associated with this user
-
-//     // Add more delete operations for other dependent models here
-//     next();
-//   } catch (error) {
-//     next(error as Error);
-//   }
-// });
 
 const User = mongoose.model<IUser>('User', UserSchema);
 export default User;

@@ -1,2 +1,0 @@
-# Nova-CRM-Backend
- 

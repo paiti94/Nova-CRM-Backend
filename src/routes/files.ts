@@ -5,11 +5,13 @@ import File from '../models/File';
 import Folder from '../models/Folder';
 import { FolderService } from '../services/folderService';
 import mongoose from 'mongoose';
-
+import archiver from 'archiver'; 
+import { Readable } from 'stream';
+import { S3Client, GetObjectCommand } from '@aws-sdk/client-s3';
 const router = express.Router();
 const fileUploadService = new FileUploadService();
-
-
+import { sendSmtp2GoEmail } from '../services/emailService';
+import User from '../models/User';
 
 router.get('/folders', validateAuth0Token, attachUser as express.RequestHandler, async (req, res) => {
   try {
@@ -146,12 +148,14 @@ router.post('/folders', validateAuth0Token, attachUser as express.RequestHandler
 router.post('/presigned-url', validateAuth0Token, attachUser as express.RequestHandler, async (req, res) => {
   try {
     const { fileName, fileType, folderId, clientId } = req.body;
+    console.log(req.body);
     if (!fileName || !folderId || !clientId) {
        res.status(400).json({ message: 'Missing required fields' });
        return;
     }
     const key = fileUploadService.generateFileKey(fileName, req.user._id, folderId);
     const presignedUrl = await fileUploadService.generatePresignedUrlForUploading(key, fileType);
+    
     res.json({ presignedUrl, key });
   } catch (error) {
     console.error('Error generating presigned URL:', error);
@@ -159,35 +163,59 @@ router.post('/presigned-url', validateAuth0Token, attachUser as express.RequestH
   }
 });
 
-// Save file metadata after upload
-router.post('/', validateAuth0Token, attachUser as express.RequestHandler, async (req, res) => {
-  try {
-    console.log('File metadata save attempt:', {
-      path: req.path,
-      method: req.method,
-      body: req.body,
-    });
-    const { name, type, size, key, folderId, clientId, taskId } = req.body;
-    const file = new File({
-      name,
-      type,
-      size,
-      key,
-      folder: folderId || null,
-      uploadedBy: req.user._id,
-      clientId: clientId || null,
-      accessibleTo: clientId ? [clientId] : [],
-      task: taskId || null,
-      readBy: [], 
-    });
-    await file.save();
-    res.status(201).json(file);
-  } catch (error) {
-    res.status(500).json({ message: 'Error saving file metadata' });
-    console.error('Error saving file metadata:', error);
-  }
-});
 
+router.post('/', validateAuth0Token, attachUser as express.RequestHandler, async (req, res) => {
+    try {
+      const { name, type, size, key, folderId, clientId, taskId } = req.body;
+      const file = new File({
+        name,
+        type,
+        size,
+        key,
+        folder: folderId || null,
+        uploadedBy: req.user._id,
+        clientId: clientId || null,
+        accessibleTo: clientId ? [clientId] : [],
+        task: taskId || null,
+      });
+
+      await file.save();
+      const fileUrl = `${process.env.CRM_URL}/files/`;
+
+      if (req.user.role === 'admin' && clientId) {
+        // Admin uploaded for a user -> notify only the user
+        const clientUser = await User.findById(clientId);
+        if (clientUser && clientUser.email) {
+          await sendSmtp2GoEmail(
+            clientUser.email,
+            'A new file has been uploaded for you',
+            `A new file "${file.name}" has been uploaded by your accountant. View: ${fileUrl}`,
+            `<p>A new file <b>${file.name}</b> has been uploaded by your accountant.</p>
+             <p><a href="${fileUrl}">View your file in CRM</a></p>`,
+            req.user.email
+          );
+        }
+      } else if (req.user.role !== 'admin') {
+        // Non-admin uploaded -> notify all admins
+        const adminEmails = ['paiti94@gmail.com', 'ali@novatax.ca'];
+        await sendSmtp2GoEmail(
+          adminEmails,
+          `New file uploaded by ${req.user.name || req.user.email}`,
+          `A new file "${file.name}" was uploaded by ${req.user.name || req.user.email}. View: ${fileUrl}`,
+          `<p>A new file <b>${file.name}</b> was uploaded by <b>${req.user.name || req.user.email}</b>.</p>
+           <p><a href="${fileUrl}">View in CRM</a></p>`,
+          req.user.email
+        );
+      }
+
+
+      res.status(201).json(file);
+    } catch (error) {
+      res.status(500).json({ message: 'Error saving file metadata' });
+      console.error('Error saving file metadata:', error);
+    }
+  }
+);
 // Get download URL
 router.get('/download/:fileId', validateAuth0Token, attachUser as express.RequestHandler, async (req, res) => {
   try {
@@ -214,6 +242,10 @@ router.get('/download/:fileId', validateAuth0Token, attachUser as express.Reques
       return;
     }
     console.log('Generating presigned URL for key:', file.key);
+
+    await File.findByIdAndUpdate(fileId, {
+      $addToSet: { readBy: req.user._id }
+    });
 
     const downloadUrl = await fileUploadService.generatePresignedUrl(file.key, file.type);
     res.json({ downloadUrl });
@@ -305,50 +337,122 @@ router.delete('/folders/:folderId', validateAuth0Token, attachUser as express.Re
   }
 });
 
-// PATCH /files/:fileId/mark-read
-router.patch('/:fileId/mark-read', async (req, res) => {
-  const { fileId } = req.params;
-  const userId = req.body.userId;
-
-  if (!userId)  {
-    res.status(400).json({ error: 'Missing userId' });
-    return;
-  }
-
+router.patch('/:fileId/move', validateAuth0Token, attachUser as express.RequestHandler, async (req, res) => {
   try {
-    await File.findByIdAndUpdate(fileId, {
-      $addToSet: { readBy: userId }, // prevents duplicates
-    });
-     res.json({ message: 'Marked as read' });
-     return;
-  } catch (err) {
-     res.status(500).json({ error: 'Failed to mark as read' });
-     return;
+    const { fileId } = req.params;
+    const { folderId } = req.body;
+    if (!folderId) {
+      res.status(400).json({ message: 'folderId is required' }); 
+      return;
+    } 
+
+    const file = await File.findById(fileId);
+    if (!file) {
+       res.status(404).json({ message: 'File not found' });
+       return;
+    } 
+
+    if (!file.uploadedBy.equals(req.user._id) && req.user.role !== 'admin'){
+       res.status(403).json({ message: 'Permission denied' });
+       return;
+    }
+
+    const targetFolder = await Folder.findById(folderId);
+    if (!targetFolder) {
+       res.status(404).json({ message: 'Target folder not found' });
+       return;
+    }
+
+    if (targetFolder.isInternal && req.user.role !== 'admin'){
+       res.status(403).json({ message: 'Cannot move to internal folder' });
+       return;
+    }
+      
+    if (targetFolder.clientId && !targetFolder.clientId.equals(req.user._id) && req.user.role !== 'admin'){
+       res.status(403).json({ message: "Cannot move to another user's folder" });
+       return;
+    }
+
+    const oldKey = file.key;
+
+    // --------- PRESERVE TIMESTAMP ----------
+    const match = oldKey.match(/(\d+)-[^/]+$/);
+    const timestamp = match ? match[1] : Date.now();
+    const sanitizedFileName = file.name.replace(/[^a-zA-Z0-9.-]/g, '_');
+    const newKey = `${file.uploadedBy}/${folderId}/${timestamp}-${sanitizedFileName}`;
+    // ---------------------------------------
+
+    if (oldKey !== newKey) {
+      const fileUploadService = new FileUploadService();
+      await fileUploadService.copyFile(oldKey, newKey);
+      await fileUploadService.deleteFile(oldKey);
+      file.key = newKey;
+    }
+
+    file.folder = folderId;
+    await file.save();
+
+    res.json({ message: 'File moved successfully', file });
+  } catch (error) {
+    console.error('Error moving file:', error);
+    res.status(500).json({ message: 'Error moving file' });
   }
 });
 
-// GET /files/unread-count?clientId=xxx&userId=xxx
-router.get('/unread-count', async (req, res) => {
-  const { clientId, userId } = req.query;
+router.get('/folders/:folderId/download-all', validateAuth0Token, attachUser as express.RequestHandler, async (req, res) => {
+    const { folderId } = req.params;
+    try {
+      // 1. Find all files for this folder
+      const files = await File.find({ folder: folderId });
+      if (!files.length) {
+        res.status(404).json({ message: 'No files to download' });
+        return;
+      }
 
-  if (!clientId || !userId) {
-     res.status(400).json({ error: 'Missing clientId or userId' });
-     return;
+      // 2. Set headers
+      res.setHeader('Content-Disposition', `attachment; filename="folder-${folderId}.zip"`);
+      res.setHeader('Content-Type', 'application/zip');
+      res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
+      res.setHeader('Pragma', 'no-cache');
+      res.setHeader('Expires', '0');
+      res.setHeader('Surrogate-Control', 'no-store');
+
+      // 3. Create the archive and pipe to response
+      const archive = archiver('zip', { zlib: { level: 9 } });
+      archive.on('error', err => {
+        console.error('Archiver error:', err);
+        if (!res.headersSent) res.status(500).end();
+      });
+      archive.pipe(res);
+
+      // 4. Use your fileUploadService to stream each file from S3 into the ZIP
+      for (const file of files) {
+        try {
+          const s3Result = await fileUploadService.getReadStream(file.key);
+          if (s3Result && s3Result.Body) {
+            archive.append(s3Result.Body, { name: file.name });
+            console.log(`Added file: ${file.name}`);
+          } else {
+            console.warn(`Could NOT fetch: ${file.key} -- added .txt instead`);
+            archive.append(`Could not fetch file: ${file.key}`, { name: file.name + '.txt' });
+          }
+        } catch (err) {
+          console.error(`Error streaming file ${file.key}:`, err);
+          archive.append(`Error fetching file: ${file.key}`, { name: file.name + '.txt' });
+        }
+      }
+      
+      await File.updateMany(
+        { folder: folderId },
+        { $addToSet: { readBy: req.user._id } }
+      );
+      // 5. Finalize the zip (triggers sending)
+      await archive.finalize();
+    } catch (err) {
+      console.error('Error generating zip:', err);
+      if (!res.headersSent) res.status(500).end();
+    }
   }
-
-  try {
-    const count = await File.countDocuments({
-      clientId,
-      readBy: { $ne: userId },
-    });
-
-     res.json({ unreadCount: count });
-     return;
-  } catch (err) {
-     res.status(500).json({ error: 'Failed to count unread files' });
-     return;
-  }
-});
-
+);
 
 export default router;

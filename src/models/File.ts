@@ -14,7 +14,7 @@ export interface IFile extends Document {
     createdAt: Date;
     updatedAt: Date;
     task?: mongoose.Types.ObjectId; // Reference to Task
-    readBy: { type: [String], default: [] };
+    readBy: [{ type: mongoose.Schema.Types.ObjectId, ref: 'User' }];
 }
 const FileSchema = new Schema({
     name: { type: String, required: true },
@@ -30,7 +30,7 @@ const FileSchema = new Schema({
     createdAt: { type: Date, default: Date.now },
     updatedAt: { type: Date, default: Date.now },
     task: { type:mongoose.Schema.Types.ObjectId, ref: 'Task', default: null },
-    readBy: { type: [String], default: [] },
+    readBy: [{ type: mongoose.Schema.Types.ObjectId, ref: 'User' }]
 });
 
 const File = mongoose.model('File', FileSchema);

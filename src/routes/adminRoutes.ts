@@ -1,6 +1,6 @@
 import express from 'express';
 import User from '../models/User';
-import { validateAuth0Token } from '../middleware/auth';
+import { validateAuth0Token, } from '../middleware/auth';
 
 const router = express.Router();
 
@@ -36,12 +36,13 @@ router.post('/create-initial-admin', async (req, res) => {
 });
 
 // Protected endpoint for admins to update user roles
-router.patch('/users/:userId/role', validateAuth0Token, async (req, res) => {
+router.patch('/users/:userId/role', validateAuth0Token , async (req, res) => {
   try {
     const { role } = req.body;
     const { userId } = req.params;
 
     // Verify the requester is an admin
+    // const requester = await User.findById(req.authInfo?.payload.sub);
     const requester = await User.findById(req.auth?.payload.sub);
     if (requester?.role !== 'admin') {
        res.status(403).json({ message: 'Only admins can update roles' });
