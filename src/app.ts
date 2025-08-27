@@ -9,13 +9,17 @@ import fileRouter from './routes/files';
 import dashboardRouter from './routes/dashboard';
 import tagRouter from './routes/tags';
 import microsoftAuthRouter from './routes/microsoftAuth';
+import openAiRouter from './routes/openai';
 import { createServer } from 'http';
 import { WebSocketService } from './services/websocket';
 import { FolderService } from './services/folderService';
 import adminRouter from './routes/adminRoutes';
+import subscriptionsRouter from './routes/microsoftSubscriptions';
+import notificationsRouter from './routes/microsoftNotifications';
 import { attachUser, validateAuth0Token, } from './middleware/auth';
 import helmet from 'helmet';
 import rateLimit from 'express-rate-limit';
+import { startRenewalScheduler } from './services/subscriptionRenewal';
 
 dotenv.config();
 // Override console.log before any other imports
@@ -72,6 +76,8 @@ app.use('/api/users', sensitiveLimiter);
 // Routes - just use the combined router
 app.use('/api/users', userRouter);
 app.use('/api/microsoft', microsoftAuthRouter);
+app.use('/api/microsoft', subscriptionsRouter); 
+app.use('/api', notificationsRouter);  
 // Protected routes - add middleware here
 const protectedRoutes = express.Router();
 protectedRoutes.use(validateAuth0Token);
@@ -84,10 +90,11 @@ protectedRoutes.use('/files', fileRouter);
 protectedRoutes.use('/dashboard', dashboardRouter);
 protectedRoutes.use('/admin', adminRouter);
 protectedRoutes.use('/tags', tagRouter);
+protectedRoutes.use('/openai', openAiRouter);
 // Use the protected routes after the public ones
 app.use('/api', protectedRoutes);
 
-
+startRenewalScheduler();
 // Error handling middleware
 app.use((err: any, req: express.Request, res: express.Response, next: express.NextFunction) => {
   console.error('Error details:', {

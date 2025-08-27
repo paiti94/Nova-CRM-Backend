@@ -11,24 +11,32 @@ const router = express.Router();
 
 // Short-lived state store to prevent tampering
 const stateStore = new Map<string, { userId: string; expiresAt: number }>();
-const putState = (userId: string) => {
-  const state = crypto.randomUUID();
-  stateStore.set(state, { userId, expiresAt: Date.now() + 5 * 60_000 }); // 5 min
-  return state;
-};
-const popState = (state: string | undefined) => {
-  if (!state) return null;
-  const item = stateStore.get(state);
-  if (!item) return null;
-  stateStore.delete(state);
-  if (Date.now() > item.expiresAt) return null;
-  return item.userId;
-};
+
+function stripHtmlToText(html: string): string {
+  return html
+    .replace(/<style[\s\S]*?<\/style>/gi, '')
+    .replace(/<script[\s\S]*?<\/script>/gi, '')
+    .replace(/<br\s*\/?>/gi, '\n')
+    .replace(/<\/(p|div|li|tr|h[1-6])>/gi, '\n')
+    .replace(/<[^>]+>/g, '')
+    .replace(/&nbsp;/g, ' ')
+    .replace(/&amp;/g, '&')
+    .replace(/\s+\n/g, '\n')
+    .trim();
+}
+
+// extremely lightweight MIME text extractor
+function extractTextFromMime(mime: string): { text?: string; html?: string } {
+  // Try to find text/plain part
+  const textMatch = mime.match(/Content-Type:\s*text\/plain[\s\S]*?\r?\n\r?\n([\s\S]*?)\r?\n--/i);
+  const htmlMatch = mime.match(/Content-Type:\s*text\/html[\s\S]*?\r?\n\r?\n([\s\S]*?)\r?\n--/i);
+  const text = textMatch?.[1]?.trim();
+  const html = htmlMatch?.[1]?.trim();
+  return { text, html };
+}
 
 const CLIENT_ID = process.env.MS_CLIENT_ID!;
 const CLIENT_SECRET = process.env.MS_CLIENT_SECRET!;
-const SERVER_REDIRECT_URI = process.env.MS_REDIRECT_URI!; // e.g. http://localhost:5001/api/microsoft/callback
-const CLIENT_URL = process.env.CLIENT_URL || 'http://localhost:5173';
 const SCOPES = 'openid profile email offline_access Mail.Read';
 const oauth2 = new AuthorizationCode({
     client: {
@@ -41,6 +49,112 @@ const oauth2 = new AuthorizationCode({
       tokenPath: "/common/oauth2/v2.0/token",
     },
   });
+
+
+// 3) Protected: fetch latest email (and auto-refresh)
+export async function getValidAccessToken(userId: string) {
+  // read tokens including hidden fields
+  const user = await User.findById(userId).select('+msTokens.access_token +msTokens.refresh_token').lean();
+  const tokens = user?.msTokens;
+  if (!tokens?.access_token) return null;
+
+  const isExpired = tokens.expires_at && new Date(tokens.expires_at).getTime() < Date.now();
+  if (!isExpired) return tokens.access_token;
+
+  if (!tokens.refresh_token) return null;
+
+  // refresh
+  const tokenUrl = 'https://login.microsoftonline.com/common/oauth2/v2.0/token';
+  const form = qs.stringify({
+    client_id: CLIENT_ID,
+    client_secret: CLIENT_SECRET,
+    grant_type: 'refresh_token',
+    refresh_token: tokens.refresh_token,
+    scope: SCOPES,
+  });
+
+  const r = await axios.post(tokenUrl, form, { headers: { 'Content-Type': 'application/x-www-form-urlencoded' } });
+  const nt = r.data as { access_token: string; refresh_token?: string; expires_in: number; token_type: string; scope?: string };
+  const expiresAt = new Date(Date.now() + (nt.expires_in - 60) * 1000);
+
+  await User.findByIdAndUpdate(userId, {
+    msTokens: {
+      access_token: nt.access_token,
+      refresh_token: nt.refresh_token || tokens.refresh_token,
+      token_type: nt.token_type,
+      scope: nt.scope || SCOPES,
+      expires_at: expiresAt,
+      expires_in: nt.expires_in,
+    }
+  });
+
+  return nt.access_token;
+}
+export async function fetchLatestEmailForUser(userId: string, accessToken: string) {
+  const listUrl =
+    "https://graph.microsoft.com/v1.0/me/mailFolders/Inbox/messages" +
+    "?$top=1&$orderby=receivedDateTime desc" +
+    "&$select=id,subject,from,receivedDateTime,bodyPreview,conversationId,internetMessageId,webLink";
+
+  const listRes = await axios.get(listUrl, { headers: { Authorization: `Bearer ${accessToken}` } });
+  const m = listRes.data?.value?.[0];
+  if (!m) return null;
+
+  const encodedId = encodeURIComponent(m.id);
+  const detailUrl =
+    `https://graph.microsoft.com/v1.0/me/messages/${encodedId}` +
+    `?$select=body,uniqueBody,subject,from,receivedDateTime,conversationId,internetMessageId,webLink`;
+
+  const detailRes = await axios.get(detailUrl, {
+    headers: {
+      Authorization: `Bearer ${accessToken}`,
+      Prefer: 'outlook.body-content-type="text"', // ask for text first
+    },
+    validateStatus: () => true,
+  });
+
+  if (detailRes.status !== 200) {
+    console.error("Graph detail error:", detailRes.status, detailRes.data);
+    throw new Error(`Failed to fetch email body: ${detailRes.status}`);
+  }
+
+  // Prefer full body; fallback to uniqueBody; finally to bodyPreview
+  const bodyObj = detailRes.data?.body || detailRes.data?.uniqueBody;
+  let bodyText = (bodyObj?.content ?? "").trim();
+  if (!bodyText) bodyText = (m.bodyPreview ?? "").trim();
+
+  // If content is suspiciously short, do a MIME fallback
+  if (bodyText.length < 15) {
+    try {
+      const mimeRes = await axios.get(
+        `https://graph.microsoft.com/v1.0/me/messages/${encodedId}/$value`,
+        { headers: { Authorization: `Bearer ${accessToken}` }, responseType: "text", validateStatus: () => true }
+      );
+      if (mimeRes.status === 200 && typeof mimeRes.data === "string") {
+        const { text, html } = extractTextFromMime(mimeRes.data);
+        if (text && text.trim().length > bodyText.length) bodyText = text.trim();
+        else if (html && stripHtmlToText(html).length > bodyText.length) bodyText = stripHtmlToText(html);
+      } else {
+        console.warn("MIME fetch non-200:", mimeRes.status);
+      }
+    } catch (e) {
+      console.warn("MIME fetch failed, continuing with existing bodyText");
+    }
+  }
+
+  return {
+    messageId: m.id as string,
+    subject: m.subject ?? "",
+    from: m.from?.emailAddress?.address ?? "",
+    fromName: m.from?.emailAddress?.name ?? "",   
+    receivedAt: m.receivedDateTime as string,
+    bodyText,
+    conversationId: m.conversationId,
+    internetMessageId: m.internetMessageId,
+    webLink: m.webLink,
+  };
+}
+
   
 router.get("/login", async (req, res) => {
     try {
@@ -143,8 +257,28 @@ router.get('/callback', async (req, res) => {
       await user.save();
   
       const clientUrl = process.env.CLIENT_URL || 'http://localhost:5173';
-       res.redirect(`${clientUrl}/outlook?connected=1`);
-       return;
+      res.redirect(`${clientUrl}/outlook-popup-done`);
+      return;
+      // res.set('Content-Type', 'text/html').send(`<!doctype html>
+      //   <html>
+      //     <head><meta charset="utf-8"><title>Connected</title></head>
+      //     <body>
+      //       <script>
+      //         (function () {
+      //           try {
+      //             if (window.opener && !window.opener.closed) {
+      //               // notify the opener (parent SPA) that MS connect finished
+      //               window.opener.postMessage({ type: 'ms-connected' }, '${clientUrl}');
+      //             }
+      //           } catch (e) { /* ignore */ }
+      //           // attempt to close the popup
+      //           setTimeout(function(){ window.close(); }, 50);
+      //         })();
+      //       </script>
+      //       <p>You can close this window.</p>
+      //     </body>
+      //   </html>`);
+      //   return;
     } catch (err: any) {
       console.error('MS callback error:', err?.response?.data || err);
        res.status(500).json({ error: 'OAuth callback failed' });
@@ -152,63 +286,35 @@ router.get('/callback', async (req, res) => {
     }
   });
 
-// 3) Protected: fetch latest email (and auto-refresh)
-async function getValidAccessToken(userId: string) {
-  // read tokens including hidden fields
-  const user = await User.findById(userId).select('+msTokens.access_token +msTokens.refresh_token').lean();
-  const tokens = user?.msTokens;
-  if (!tokens?.access_token) return null;
-
-  const isExpired = tokens.expires_at && new Date(tokens.expires_at).getTime() < Date.now();
-  if (!isExpired) return tokens.access_token;
-
-  if (!tokens.refresh_token) return null;
-
-  // refresh
-  const tokenUrl = 'https://login.microsoftonline.com/common/oauth2/v2.0/token';
-  const form = qs.stringify({
-    client_id: CLIENT_ID,
-    client_secret: CLIENT_SECRET,
-    grant_type: 'refresh_token',
-    refresh_token: tokens.refresh_token,
-    scope: SCOPES,
-  });
-
-  const r = await axios.post(tokenUrl, form, { headers: { 'Content-Type': 'application/x-www-form-urlencoded' } });
-  const nt = r.data as { access_token: string; refresh_token?: string; expires_in: number; token_type: string; scope?: string };
-  const expiresAt = new Date(Date.now() + (nt.expires_in - 60) * 1000);
-
-  await User.findByIdAndUpdate(userId, {
-    msTokens: {
-      access_token: nt.access_token,
-      refresh_token: nt.refresh_token || tokens.refresh_token,
-      token_type: nt.token_type,
-      scope: nt.scope || SCOPES,
-      expires_at: expiresAt,
-      expires_in: nt.expires_in,
-    }
-  });
-
-  return nt.access_token;
-}
 
 router.get('/latest-email', validateAuth0Token, attachUser as any, async (req, res) => {
+  // try {
+  //   const userId = String(req.user!._id);
+  //   const accessToken = await getValidAccessToken(userId);
+  //   if (!accessToken) { res.status(400).json({ error: 'Microsoft account not connected' }); return; }
+
+  //   const graph = await axios.get(
+  //     'https://graph.microsoft.com/v1.0/me/mailFolders/Inbox/messages?$top=1&$orderby=receivedDateTime desc',
+  //     { headers: { Authorization: `Bearer ${accessToken}` } }
+  //   );
+  //   const m = graph.data.value?.[0];
+  //   console.log(m);
+  //   res.json(m ? {
+  //     subject: m.subject,
+  //     from: m.from?.emailAddress?.address,
+  //     received: m.receivedDateTime,
+  //     bodyPreview: m.bodyPreview
+  //   } : null);
+  // } catch (e) {
+  //   console.error('latest-email error', e);
+  //   res.status(500).json({ error: 'Failed to fetch latest email' });
+  // }
   try {
     const userId = String(req.user!._id);
     const accessToken = await getValidAccessToken(userId);
     if (!accessToken) { res.status(400).json({ error: 'Microsoft account not connected' }); return; }
-
-    const graph = await axios.get(
-      'https://graph.microsoft.com/v1.0/me/mailFolders/Inbox/messages?$top=1&$orderby=receivedDateTime desc',
-      { headers: { Authorization: `Bearer ${accessToken}` } }
-    );
-    const m = graph.data.value?.[0];
-    res.json(m ? {
-      subject: m.subject,
-      from: m.from?.emailAddress?.address,
-      received: m.receivedDateTime,
-      bodyPreview: m.bodyPreview
-    } : null);
+    const email = await fetchLatestEmailForUser(userId, accessToken);
+    res.json(email); // might be null if no mail
   } catch (e) {
     console.error('latest-email error', e);
     res.status(500).json({ error: 'Failed to fetch latest email' });

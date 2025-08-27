@@ -97,12 +97,17 @@ const UserSchema = new Schema({
   },
 }, {
   toJSON: {
+    virtuals: true,
     transform(doc, ret) {
-      delete ret.msTokens; // never serialize to client
+      delete ret._id; // optional: if you want to use id instead
+      delete ret.msTokens;
       return ret;
     }
   }
 });
-
+UserSchema.virtual('msConnected').get(function() {
+  // A simple check to see if the access token exists.
+  return !!this.msTokens?.access_token;
+});
 const User = mongoose.model<IUser>('User', UserSchema);
 export default User;

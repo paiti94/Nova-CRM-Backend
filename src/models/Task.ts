@@ -17,6 +17,17 @@ export interface ITask extends Document {
   comments: IComment[];
   createdAt: Date;
   updatedAt: Date;
+
+  // NEW: source metadata
+  source?: 'manual' | 'outlook';
+  sourceEmailId?: string;     // Graph message id
+  sourceThreadId?: string;    // conversationId
+  sourceWebLink?: string;     // Outlook web link
+  sourceFromName?: string;
+  sourceFromAddress?: string;
+  sourceReceivedAt?: Date;
+  sourceSubject?: string;
+  sourceSnippet?: string;     // short plain-text excerpt used for AI
 }
 
 const TaskSchema = new Schema({
@@ -43,9 +54,22 @@ const TaskSchema = new Schema({
     createdAt: { type: Date, default: Date.now },
   }],
   createdAt: { type: Date, default: Date.now },
-  updatedAt: { type: Date, default: Date.now }
-});
+  updatedAt: { type: Date, default: Date.now },
+  source: { type: String, enum: ['manual', 'outlook'], default: 'manual' },
+  sourceEmailId: { type: String, index: true },
+  sourceThreadId: { type: String },
+  sourceWebLink: { type: String },
+  sourceFromName: { type: String },
+  sourceFromAddress: { type: String },
+  sourceReceivedAt: { type: Date },
+  sourceSubject: { type: String },
+  sourceSnippet: { type: String }, 
+}, { timestamps: true });
 
+TaskSchema.index(
+  { createdBy: 1, source: 1, sourceEmailId: 1 },
+  { unique: true, partialFilterExpression: { source: { $exists: true }, sourceEmailId: { $exists: true } } }
+);
 const Task = mongoose.model<ITask>('Task', TaskSchema);
 
 export default Task;
