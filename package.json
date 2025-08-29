@@ -39,6 +39,7 @@
     "zod": "^3.25.76"
   },
   "devDependencies": {
+    "@flydotio/dockerfile": "^0.7.10",
     "@types/archiver": "^6.0.3",
     "@types/jsonwebtoken": "^9.0.10",
     "@types/nodemailer": "^6.4.17",
